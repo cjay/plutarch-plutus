@@ -496,114 +496,126 @@ applyOrder' ::
   b
 applyOrder' argOrder fun a b = branchOrder argOrder (fun a b) (fun b a)
 
-zipMergeInsert ::
-  forall (s :: S) (k :: PType) (v :: PType).
-  (POrd k, PIsData k) =>
-  MergeHandler (PAsData k) (PAsData v) s ->
-  -- | 'PSTrue' means first arg is left, second arg is right.
+data MergeCarrier (k :: PType) (v :: PType) (s :: S) = MergeCarrier
+  { merge ::
+      Term
+        s
+        ( PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+            :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+            :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+        )
+  , mergeInsert ::
+      Term
+        s
+        ( PSBool
+            :--> PBuiltinPair (PAsData k) (PAsData v)
+            :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+            :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+            :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
+        )
+  -- ^ 'PSTrue' means first arg is left, second arg is right.
   -- The first list gets passed in deconstructed form as head and tail
   -- separately.
-  Term
-    s
-    ( PSBool
-        :--> PBuiltinPair (PAsData k) (PAsData v)
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-    )
-zipMergeInsert (MergeHandler bothPresent leftPresent rightPresent) =
-  pfix #$ plam $ \self argOrder' x xs' ys ->
-    pmatch argOrder' \argOrder ->
-      pmatch ys $ \case
-        PNil ->
-          -- picking handler for presence of x-side only
-          case branchOrder argOrder leftPresent rightPresent of
-            DropOne -> pcon PNil
-            PassOne -> pcons # x # xs'
-            HandleOne handler ->
-              List.pmap
-                # ( plam $ \pair ->
-                      plet (pfstBuiltin # pair) \k ->
-                        ppairDataBuiltin # k # handler k (psndBuiltin # pair)
-                  )
-                # (pcons # x # xs')
-        PCons y1 ys' -> unTermCont $ do
-          y <- tcont $ plet y1
-          xk <- tcont $ plet (pfstBuiltin # x)
-          yk <- tcont $ plet (pfstBuiltin # y)
-          pure $
-            pif
-              (xk #== yk)
-              ( case bothPresent of
-                  DropBoth -> applyOrder argOrder (zipMerge rightPresent self) xs' ys'
-                  PassArg passLeft ->
-                    if passLeft == argOrder
-                      then pcons # x # applyOrder argOrder (zipMerge rightPresent self) xs' ys
-                      else pcons # y # applyOrder argOrder (zipMerge rightPresent self) (pcons # x # xs') ys'
-                  HandleBoth merge ->
-                    pcons
-                      # ( ppairDataBuiltin
-                            # xk
-                              #$ applyOrder' argOrder (merge xk) (psndBuiltin # x) (psndBuiltin # y)
-                        )
-                        #$ applyOrder
-                          argOrder
-                          (zipMerge rightPresent self)
-                          xs'
-                          ys'
-              )
-              ( pif
-                  (pfromData xk #< pfromData yk)
-                  ( -- picking handler for presence of only x-side
-                    case branchOrder argOrder leftPresent rightPresent of
-                      DropOne -> self # branchOrder argOrder psfalse pstrue # y # ys' # xs'
-                      PassOne -> pcons # x # applyOrder argOrder (zipMerge rightPresent self) xs' ys
+  }
+  deriving stock (Generic)
+  deriving anyclass (PlutusType)
+instance DerivePlutusType (MergeCarrier k v) where type DPTStrat _ = PlutusTypeScott
+
+mergeCarrier ::
+  (POrd k, PIsData k) =>
+  MergeHandler (PAsData k) (PAsData v) s ->
+  Term s (MergeCarrier k v :--> MergeCarrier k v)
+mergeCarrier (MergeHandler bothPresent leftPresent rightPresent) =
+  plam \self ->
+    let mergeInsert = pmatch self \(MergeCarrier {mergeInsert}) -> mergeInsert
+        merge = pmatch self \(MergeCarrier {merge}) -> merge
+        mergeInsertImpl =
+          pfix #$ plam $ \self argOrder' x xs' ys ->
+            pmatch argOrder' \argOrder ->
+              pmatch ys $ \case
+                PNil ->
+                  -- picking handler for presence of x-side only
+                  case branchOrder argOrder leftPresent rightPresent of
+                    DropOne -> pcon PNil
+                    PassOne -> pcons # x # xs'
+                    HandleOne handler ->
+                      List.pmap
+                        # ( plam $ \pair ->
+                              plet (pfstBuiltin # pair) \k ->
+                                ppairDataBuiltin # k # handler k (psndBuiltin # pair)
+                          )
+                        # (pcons # x # xs')
+                PCons y1 ys' -> unTermCont $ do
+                  y <- tcont $ plet y1
+                  xk <- tcont $ plet (pfstBuiltin # x)
+                  yk <- tcont $ plet (pfstBuiltin # y)
+                  pure $
+                    pif
+                      (xk #== yk)
+                      ( case bothPresent of
+                          DropBoth -> applyOrder argOrder merge xs' ys'
+                          PassArg passLeft ->
+                            if passLeft == argOrder
+                              then pcons # x # applyOrder argOrder merge xs' ys
+                              else pcons # y # applyOrder argOrder merge (pcons # x # xs') ys'
+                          HandleBoth mergeVals ->
+                            pcons
+                              # ( ppairDataBuiltin
+                                    # xk
+                                      #$ applyOrder' argOrder (mergeVals xk) (psndBuiltin # x) (psndBuiltin # y)
+                                )
+                                #$ applyOrder
+                                  argOrder
+                                  merge
+                                  xs'
+                                  ys'
+                      )
+                      ( pif
+                          (pfromData xk #< pfromData yk)
+                          ( -- picking handler for presence of only x-side
+                            case branchOrder argOrder leftPresent rightPresent of
+                              DropOne -> self # branchOrder argOrder psfalse pstrue # y # ys' # xs'
+                              PassOne -> pcons # x # applyOrder argOrder merge xs' ys
+                              HandleOne handler ->
+                                pcons
+                                  # (ppairDataBuiltin # xk # handler xk (psndBuiltin # x))
+                                  # (self # branchOrder argOrder psfalse pstrue # y # ys' # xs')
+                          )
+                          ( -- picking handler for presence of only y-side
+                            case branchOrder argOrder rightPresent leftPresent of
+                              DropOne -> self # argOrder' # x # xs' # ys'
+                              PassOne -> pcons # y # applyOrder argOrder merge (pcons # x # xs') ys'
+                              HandleOne handler ->
+                                pcons
+                                  # (ppairDataBuiltin # yk # handler yk (psndBuiltin # y))
+                                  # (self # argOrder' # x # xs' # ys')
+                          )
+                      )
+     in pcon $
+          MergeCarrier
+            { merge =
+                plam $ \ls rs -> pmatch ls $ \case
+                  PNil ->
+                    case rightPresent of
+                      DropOne -> pcon PNil
+                      PassOne -> rs
                       HandleOne handler ->
-                        pcons
-                          # (ppairDataBuiltin # xk # handler xk (psndBuiltin # x))
-                          # (self # branchOrder argOrder psfalse pstrue # y # ys' # xs')
-                  )
-                  ( -- picking handler for presence of only y-side
-                    case branchOrder argOrder rightPresent leftPresent of
-                      DropOne -> self # argOrder' # x # xs' # ys'
-                      PassOne -> pcons # y # applyOrder argOrder (zipMerge rightPresent self) (pcons # x # xs') ys'
-                      HandleOne handler ->
-                        pcons
-                          # (ppairDataBuiltin # yk # handler yk (psndBuiltin # y))
-                          # (self # argOrder' # x # xs' # ys')
-                  )
-              )
+                        List.pmap
+                          # ( plam $ \pair ->
+                                plet (pfstBuiltin # pair) \k ->
+                                  ppairDataBuiltin # k # handler k (psndBuiltin # pair)
+                            )
+                          # rs
+                  PCons l ls' -> mergeInsert # pstrue # l # ls' # rs
+            , mergeInsert = mergeInsertImpl
+            }
 
 zipMerge ::
-  forall (s :: S) (k :: PType) (v :: PType).
-  OnePresentHandler (PAsData k) (PAsData v) s ->
-  Term
-    s
-    ( PSBool
-        :--> PBuiltinPair (PAsData k) (PAsData v)
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-    ) ->
-  Term
-    s
-    ( PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-        :--> PBuiltinList (PBuiltinPair (PAsData k) (PAsData v))
-    )
-zipMerge rightPresent mergeInsertRec = plam $ \ls rs -> pmatch ls $ \case
-  PNil ->
-    case rightPresent of
-      DropOne -> pcon PNil
-      PassOne -> rs
-      HandleOne handler ->
-        List.pmap
-          # ( plam $ \pair ->
-                plet (pfstBuiltin # pair) \k ->
-                  ppairDataBuiltin # k # handler k (psndBuiltin # pair)
-            )
-          # rs
-  PCons l ls' -> mergeInsertRec # pstrue # l # ls' # rs
+  forall k v s.
+  (POrd k, PIsData k) =>
+  MergeHandler (PAsData k) (PAsData v) s ->
+  Term s (MergeCarrier k v)
+zipMerge mergeHandler = punsafeCoerce pfix # mergeCarrier mergeHandler
 
 {- | Zip two 'PMap's, using a 'MergeHandler' to decide how to merge based on key
  presence on the left and right.
@@ -618,9 +630,9 @@ pzipWithData ::
         :--> PMap 'Sorted k v
         :--> PMap 'Sorted k v
     )
-pzipWithData mh@(MergeHandler _ _ rightPresent) =
+pzipWithData mh =
   plam $ \x y ->
-    pcon $ PMap $ zipMerge rightPresent (zipMergeInsert mh) # pto x # pto y
+    pcon $ PMap $ (pmatch (zipMerge mh) \(MergeCarrier {merge}) -> merge) # pto x # pto y
 
 {- | Zip two 'PMap's, using a 'MergeHandler' to decide how to merge based on key
  presence on the left and right.
